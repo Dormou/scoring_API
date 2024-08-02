@@ -104,6 +104,6 @@ Request is valid when all fields are valid.
 To run tests, run the following command
 
 ```cmd
-  python test.py
+  python -m unittest discover -s tests -t .
 ```
 
