@@ -10,6 +10,7 @@ from optparse import OptionParser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from weakref import WeakKeyDictionary
 import scoring
+from store import Store
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -56,23 +57,23 @@ class Field(object):
         return self.data.get(instance)
 
     def __set__(self, instance, value):
-        if value is None or isinstance(value, (dict, list)) and len(value) == 0:
+        if value is None:
             if self.nullable:
                 self.data[instance] = value
             else:
                 raise ValueError(f"Field {self.label} is not nullable.")
         else:
-            self.validate(value)
-            self.data[instance] = value
+            self.data[instance] = self.validate(value)
 
     def validate(self, value):
-        pass
+        return value
 
 
 class CharField(Field):
     def validate(self, value):
         if not isinstance(value, str):
             raise TypeError(f'Field {self.label} must be a string.')
+        return value
 
 
 class EmailField(CharField):
@@ -80,14 +81,16 @@ class EmailField(CharField):
         super().validate(value)
         if '@' not in value:
             raise ValueError(f'Field {self.label} has invalid format.')
+        return value
 
 
 class PhoneField(Field):
     def validate(self, value):
-        if not isinstance(value, (str, int)):
+        if not (type(value) is int or isinstance(value, str)):
             raise TypeError(f'Field {self.label} must be a string or an integer.')
         if len(str(value)) != 11 or not str(value).startswith('7'):
             raise ValueError(f'Field {self.label} has invalid format.')
+        return value
 
 
 class DateField(Field):
@@ -95,38 +98,44 @@ class DateField(Field):
         if not isinstance(value, str):
             raise TypeError(f'Field {self.label} must be a string.')
         try:
-            datetime.strptime(value, '%d.%m.%Y')
+            value = datetime.strptime(value, '%d.%m.%Y')
         except ValueError:
             raise ValueError(f'Field {self.label} has invalid format (must be DD.MM.YYYY).')
+        return value
 
 
 class BirthDayField(DateField):
     def validate(self, value):
-        super().validate(value)
-        date = datetime.strptime(value, '%d.%m.%Y')
+        value = super().validate(value)
         delta = timedelta(70 * 365)
-        if datetime.now() - delta > date:
+        if datetime.now() - delta > value:
             raise ValueError(f'Field {self.label} has unacceptable value (must be not earlier than 70 years ago)')
+        return value
 
 
 class GenderField(Field):
     def validate(self, value):
-        if not isinstance(value, int):
+        if not type(value) is int:
             raise TypeError(f'Field {self.label} must be an integer.')
-        if value not in GENDERS:
+        elif value not in GENDERS:
             raise ValueError(f'Field {self.label} has unacceptable value (must be one of {list(GENDERS.keys())})')
+        return value
 
 
 class ClientIDsField(Field):
     def validate(self, value):
-        if not isinstance(value, list) or any(not isinstance(item, int) for item in value):
-            raise TypeError(f'Field {self.label} must be a list of integers.')
+        if not isinstance(value, list):
+            raise TypeError(f'Field {self.label} must be a list')
+        if len(value) == 0 or any(not isinstance(item, int) for item in value):
+            raise ValueError(f'List in field {self.label} must contain only integers (one or more).')
+        return value
 
 
 class ArgumentsField(Field):
     def validate(self, value):
         if not isinstance(value, dict):
             raise TypeError(f'Field {self.label} must be a dictionary.')
+        return value
 
 
 class Request(metaclass=FieldsOwner):
@@ -138,7 +147,7 @@ class Request(metaclass=FieldsOwner):
                     raise ValueError(f'Field {v.label} is required')
                 value = kwargs.get(n, None)
                 v.__set__(self, value)
-                self.fields[n] = value
+                self.fields[n] = v.__get__(self, Request)
         super().__init__()
 
 
@@ -171,21 +180,21 @@ class OnlineScoreRequest(Request):
     phone = PhoneField(required=False, nullable=True)
     birthday = BirthDayField(required=False, nullable=True)
     gender = GenderField(required=False, nullable=True)
-    is_admin = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.is_admin = kwargs.get('is_admin', False)
         if not self.validate():
             raise ValueError('Insufficient data to assess, must be at least one pair:'
                              ' (phone - email) or (first name - last name) or (gender - birthday)')
 
     def validate(self):
-        return (self.phone and self.email
-                or self.first_name and self.last_name
-                or self.gender and self.birthday)
+        return (self.phone is not None and self.email is not None
+                or self.first_name is not None and self.last_name is not None
+                or self.gender is not None and self.birthday is not None)
 
     def get_response(self, ctx, store):
-        ctx.update({'has': [n for n, v in self.fields.items() if v]})
+        ctx.update({'has': [n for n, v in self.fields.items() if v is not None]})
         if self.is_admin:
             res = 42
         else:
@@ -209,17 +218,30 @@ def method_handler(request, ctx, store):
         "online_score": OnlineScoreRequest,
         "clients_interests": ClientsInterestsRequest
     }
-    request_body = MethodRequest(**request['body'])
+
+    try:
+        request_body = MethodRequest(**request['body'])
+    except Exception as ex:
+        logging.exception("Invalid request: %s" % ex)
+        if isinstance(ex, (ValueError, TypeError)):
+            response = str(ex)
+        code = INVALID_REQUEST
+        return response, code
+
     if check_auth(request_body):
         try:
-            method_request_body = (methods[request_body.method]
-                                   (**{**request_body.arguments, 'is_admin': request_body.is_admin}))
+            method_request_body = (
+                methods[request_body.method](**{**request_body.arguments, 'is_admin': request_body.is_admin}))
+
             response = method_request_body.get_response(ctx, store)
             code = OK
         except (ValueError, TypeError) as ex:
-            logging.exception(f'Invalid request: {ex}')
+            logging.exception("Invalid request: %s" % ex)
             response = str(ex)
             code = INVALID_REQUEST
+        except MemoryError as ex:
+            logging.exception("Storage error: %s" % ex)
+            code = INTERNAL_ERROR
     else:
         code = FORBIDDEN
     return response, code
@@ -229,7 +251,7 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
     router = {
         "method": method_handler
     }
-    store = None
+    store = Store()
 
     def get_request_id(self, headers):
         return headers.get('HTTP_X_REQUEST_ID', uuid.uuid4().hex)
@@ -242,10 +264,10 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
             data_string = self.rfile.read(int(self.headers['Content-Length']))
             request = json.loads(data_string)
         except Exception as ex:
-            logging.exception(f'Bad request: {ex}')
+            logging.exception("Bad request: %s" % ex)
             code = BAD_REQUEST
 
-        if request:
+        if code == OK:
             path = self.path.strip("/")
             logging.info("%s: %s %s" % (self.path, request, context["request_id"]))
             if path in self.router:
